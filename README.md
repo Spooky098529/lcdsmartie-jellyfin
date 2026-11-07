@@ -104,6 +104,41 @@ $dll(jellyfin,4,{icon} {time_mm},)
 $dll(jellyfin,2,20,)
 ```
 
+### Switching to the Jellyfin screen when playback starts
+
+LCD Smartie's **Actions** tab can use the plugin as a condition. An action runs once when
+its condition changes from false to true, not on every check. `$dll(jellyfin,3,,)` is the
+number of active sessions (paused ones included, `DefaultFilter` applied), so `> 0` means
+"something started playing". Unpausing doesn't count as a new start.
+
+In these rules, `N` is the number of your Jellyfin screen.
+
+**Jump to it when playback starts** (normal screen rotation carries on afterwards):
+
+| Variable | Condition | Value | Action |
+|---|---|---|---|
+| `$dll(jellyfin,3,,)` | `>` | `0` | `GotoScreen(N)` |
+
+**Jump to it and stay there until playback stops:**
+
+| Variable | Condition | Value | Action |
+|---|---|---|---|
+| `$dll(jellyfin,3,,)` | `>` | `0` | `GotoScreen(N)` |
+| `$dll(jellyfin,3,,)` | `>` | `0` | `FreezeScreen` |
+| `$dll(jellyfin,3,,)` | `=` | `0` | `UnfreezeScreen` |
+
+**Hide the screen while nothing is playing** (combines with either of the above):
+
+| Variable | Condition | Value | Action |
+|---|---|---|---|
+| `$dll(jellyfin,3,,)` | `=` | `0` | `DisableScreen(N)` |
+
+`DisableScreen` works in both directions: it disables the screen while the condition is true
+and enables it again as soon as playback starts.
+
+The switch happens within about `PollInterval` (2 s by default) of pressing play. If the
+server can't be reached, the count is `0`, so the rules treat that as idle.
+
 ## Troubleshooting
 
 When nothing is playing, `display` and templates show the error instead of `IdleText`.
