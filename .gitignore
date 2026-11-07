@@ -1,0 +1,8 @@
+*.dll
+*.lib
+*.exp
+*.pdb
+*.zip
+config.mk
+xwin-sdk/
+xwin-cache/
