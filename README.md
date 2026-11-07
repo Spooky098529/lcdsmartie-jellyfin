@@ -139,6 +139,45 @@ and enables it again as soon as playback starts.
 The switch happens within about `PollInterval` (2 s by default) of pressing play. If the
 server can't be reached, the count is `0`, so the rules treat that as idle.
 
+### Remote control from the LCD's buttons
+
+`$dll(jellyfin,5,<command>,<filter>)` sends a command to the session the display is showing
+for that filter. Use it as the action of a rule on the **Actions** tab, with an LCD button as
+the condition (`$MObutton(<key>)` is `1` while that key is pressed):
+
+| Variable | Condition | Value | Action |
+|---|---|---|---|
+| `$MObutton(A)` | `=` | `1` | `$dll(jellyfin,5,PlayPause,)` |
+| `$MObutton(B)` | `=` | `1` | `$dll(jellyfin,5,NextTrack,)` |
+| `$MObutton(C)` | `=` | `1` | `$dll(jellyfin,5,Seek-10,)` |
+| `$MObutton(D)` | `=` | `1` | `$dll(jellyfin,5,Seek+10,)` |
+
+Which letters your buttons send depends on the display. To bind a button in the Actions
+tab, pick `$MObutton` as the variable and press the button on the LCD. Smartie fills in
+`$MObutton(<key>)` for you.
+
+| Command | Does |
+|---|---|
+| `PlayPause` | toggle play/pause |
+| `Pause` / `Unpause` | pause / resume |
+| `Stop` | stop playback |
+| `NextTrack` / `PreviousTrack` | next / previous track or episode (also `Next`, `Prev`) |
+| `Seek+N` / `Seek-N` | jump forward / back N seconds, e.g. `Seek+30` |
+| `VolumeUp` / `VolumeDown` | client volume |
+| `ToggleMute` / `Mute` / `Unmute` | client mute |
+
+The command is sent in the background, so a slow server never freezes LCD Smartie. The
+display updates straight away: play/pause and seek change it before the server confirms,
+and the plugin polls again right after sending.
+
+Notes:
+- The client must support remote control. Most Jellyfin apps do (web, desktop, Android,
+  Android TV, Kodi). DLNA renderers and some third-party players don't.
+- If a command fails, the reason (for example `PlayPause: nothing playing`) shows in
+  `$dll(jellyfin,20,,)` for 30 seconds.
+- The API key needs permission to control sessions. Keys created under Dashboard → API
+  Keys have it.
+
 ## Troubleshooting
 
 When nothing is playing, `display` and templates show the error instead of `IdleText`.

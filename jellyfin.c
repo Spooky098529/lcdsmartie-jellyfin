@@ -12,6 +12,10 @@
  *   $dll(jellyfin,2,<width>,<filter>)   progress bar
  *   $dll(jellyfin,3,<filter>,)          number of sessions playing
  *   $dll(jellyfin,4,<format>,<filter>)  template, e.g. {artist} - {title}
+ *   $dll(jellyfin,5,<command>,<filter>) remote control (for Actions, e.g. on
+ *                                       LCD buttons): PlayPause Stop NextTrack
+ *                                       PreviousTrack Seek+10 Seek-10 VolumeUp
+ *                                       VolumeDown ToggleMute ...
  *   $dll(jellyfin,20,,)                 last error / status
  *
  * <filter> is optional: a Jellyfin user name, device name or client name.
@@ -40,23 +44,34 @@
 typedef struct {
     char user[64], device[96], client[64], type[32];
     char title[256], series[256], artist[256], album[256];
-    int season, episode, year, paused;
+    char id[64];                /* Jellyfin session id, for remote control */
+    int season, episode, year, paused, remote;
     long long pos, dur;         /* in ticks (100ns) */
+    ULONGLONG at;               /* GetTickCount64() when pos was valid */
 } Sess;
 
 static CRITICAL_SECTION g_cs;
 static Sess g_sess[MAX_SESSIONS];
 static int g_nsess;
-static ULONGLONG g_polltime;    /* GetTickCount64() of last good poll */
 static int g_havedata;
 static char g_err[256] = "Starting...";
+
+/* Remote-control commands, queued by function5 and sent by the poll thread
+   so Smartie's UI thread never waits on the network. */
+#define MAX_CMDS 8
+typedef struct { WCHAR path[256]; char name[32]; } Cmd;
+static Cmd g_q[MAX_CMDS];
+static int g_qhead, g_qlen;
+static char g_cmderr[256];
+static ULONGLONG g_cmderr_at;
+#define CMDERR_SHOW_MS 30000    /* a command error is reported for 30 s */
 
 /* config (guarded by g_cs) */
 static char g_idle[128];
 static char g_deffilter[96];
 static char g_barempty[8] = "_";
 
-static HANDLE g_thread, g_stop;
+static HANDLE g_thread, g_stop, g_wake;
 static WCHAR g_inipath[MAX_PATH];
 
 /* Return buffer must outlive the call; one per calling thread. */
@@ -268,8 +283,10 @@ static void set_err(const char *fmt, ...)
     LeaveCriticalSection(&g_cs);
 }
 
-/* Returns malloc'd NUL-terminated body, or NULL (error recorded). */
-static char *fetch_sessions(HINTERNET hs, const WCHAR *server, const WCHAR *apikey)
+/* Performs METHOD <server><suffix>. Returns the malloc'd NUL-terminated body
+   (possibly empty) on a 2xx status, or NULL with a message in err. */
+static char *http_req(HINTERNET hs, const WCHAR *server, const WCHAR *apikey,
+                      const WCHAR *method, const WCHAR *suffix, char *err, size_t errsz)
 {
     URL_COMPONENTSW uc;
     memset(&uc, 0, sizeof uc);
@@ -278,52 +295,52 @@ static char *fetch_sessions(HINTERNET hs, const WCHAR *server, const WCHAR *apik
     uc.lpszHostName = host; uc.dwHostNameLength = 256;
     uc.lpszUrlPath = path;  uc.dwUrlPathLength = 1024;
     if (!WinHttpCrackUrl(server, 0, 0, &uc)) {
-        set_err("Bad Server URL in jellyfin.ini");
+        snprintf(err, errsz, "Bad Server URL in jellyfin.ini");
         return NULL;
     }
     /* strip trailing slashes from any base path (reverse-proxy setups) */
     size_t pl = wcslen(path);
     while (pl && path[pl - 1] == L'/') path[--pl] = 0;
-    wcsncat(path, L"/Sessions?ActiveWithinSeconds=120", 1023 - pl);
+    wcsncat(path, suffix, 1023 - pl);
 
     char *body = NULL;
     HINTERNET hc = NULL, hr = NULL;
     hc = WinHttpConnect(hs, host, uc.nPort, 0);
-    if (!hc) { set_err("Connect failed (%lu)", GetLastError()); goto done; }
-    hr = WinHttpOpenRequest(hc, L"GET", path, NULL, WINHTTP_NO_REFERER,
+    if (!hc) { snprintf(err, errsz, "Connect failed (%lu)", GetLastError()); goto done; }
+    hr = WinHttpOpenRequest(hc, method, path, NULL, WINHTTP_NO_REFERER,
                             WINHTTP_DEFAULT_ACCEPT_TYPES,
                             uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
-    if (!hr) { set_err("OpenRequest failed (%lu)", GetLastError()); goto done; }
+    if (!hr) { snprintf(err, errsz, "OpenRequest failed (%lu)", GetLastError()); goto done; }
 
     WCHAR hdr[700];
     _snwprintf(hdr, 700,
         L"Authorization: MediaBrowser Client=\"LCDSmartie\", Device=\"LCDSmartie\", "
-        L"DeviceId=\"lcdsmartie-jellyfin-plugin\", Version=\"1.0\", Token=\"%ls\"\r\n"
+        L"DeviceId=\"lcdsmartie-jellyfin-plugin\", Version=\"1.1\", Token=\"%ls\"\r\n"
         L"Accept: application/json\r\n", apikey);
     hdr[699] = 0;
 
     if (!WinHttpSendRequest(hr, hdr, (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(hr, NULL)) {
         DWORD e = GetLastError();
-        if (e == ERROR_WINHTTP_TIMEOUT) set_err("Server timed out");
-        else if (e == ERROR_WINHTTP_CANNOT_CONNECT) set_err("Cannot connect to server");
-        else if (e == ERROR_WINHTTP_NAME_NOT_RESOLVED) set_err("Server name not resolved");
-        else set_err("Request failed (%lu)", e);
+        if (e == ERROR_WINHTTP_TIMEOUT) snprintf(err, errsz, "Server timed out");
+        else if (e == ERROR_WINHTTP_CANNOT_CONNECT) snprintf(err, errsz, "Cannot connect to server");
+        else if (e == ERROR_WINHTTP_NAME_NOT_RESOLVED) snprintf(err, errsz, "Server name not resolved");
+        else snprintf(err, errsz, "Request failed (%lu)", e);
         goto done;
     }
 
     DWORD status = 0, sl = sizeof status;
     WinHttpQueryHeaders(hr, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                         WINHTTP_HEADER_NAME_BY_INDEX, &status, &sl, WINHTTP_NO_HEADER_INDEX);
-    if (status == 401 || status == 403) { set_err("Unauthorized - check ApiKey"); goto done; }
-    if (status != 200) { set_err("HTTP %lu", status); goto done; }
+    if (status == 401 || status == 403) { snprintf(err, errsz, "Unauthorized - check ApiKey"); goto done; }
+    if (status < 200 || status > 299) { snprintf(err, errsz, "HTTP %lu", status); goto done; }
 
     size_t len = 0, cap = 65536;
     body = malloc(cap);
     for (;;) {
         DWORD avail = 0, got = 0;
-        if (!body) { set_err("Out of memory"); goto done; }
-        if (!WinHttpQueryDataAvailable(hr, &avail)) { set_err("Read failed"); free(body); body = NULL; goto done; }
+        if (!body) { snprintf(err, errsz, "Out of memory"); goto done; }
+        if (!WinHttpQueryDataAvailable(hr, &avail)) { snprintf(err, errsz, "Read failed"); free(body); body = NULL; goto done; }
         if (!avail) break;
         if (len + avail + 1 > cap) {
             while (len + avail + 1 > cap) cap *= 2;
@@ -331,7 +348,7 @@ static char *fetch_sessions(HINTERNET hs, const WCHAR *server, const WCHAR *apik
             if (!nb) { free(body); body = NULL; continue; }
             body = nb;
         }
-        if (!WinHttpReadData(hr, body + len, avail, &got)) { set_err("Read failed"); free(body); body = NULL; goto done; }
+        if (!WinHttpReadData(hr, body + len, avail, &got)) { snprintf(err, errsz, "Read failed"); free(body); body = NULL; goto done; }
         len += got;
     }
     body[len] = 0;
@@ -339,6 +356,52 @@ done:
     if (hr) WinHttpCloseHandle(hr);
     if (hc) WinHttpCloseHandle(hc);
     return body;
+}
+
+static void set_cmderr(const char *fmt, ...)
+{
+    va_list ap;
+    EnterCriticalSection(&g_cs);
+    va_start(ap, fmt);
+    vsnprintf(g_cmderr, sizeof g_cmderr, fmt, ap);
+    va_end(ap);
+    g_cmderr_at = GetTickCount64();
+    LeaveCriticalSection(&g_cs);
+}
+
+static int pop_cmd(Cmd *c)
+{
+    int ok = 0;
+    EnterCriticalSection(&g_cs);
+    if (g_qlen) {
+        *c = g_q[g_qhead];
+        g_qhead = (g_qhead + 1) % MAX_CMDS;
+        g_qlen--;
+        ok = 1;
+    }
+    LeaveCriticalSection(&g_cs);
+    return ok;
+}
+
+/* Send every queued command. Returns how many were sent. */
+static int send_cmds(HINTERNET hs, const WCHAR *server, const WCHAR *apikey)
+{
+    Cmd c;
+    int n = 0;
+    while (pop_cmd(&c)) {
+        char err[256];
+        char *body = http_req(hs, server, apikey, L"POST", c.path, err, sizeof err);
+        if (body) {
+            free(body);
+            EnterCriticalSection(&g_cs);
+            g_cmderr[0] = 0;
+            LeaveCriticalSection(&g_cs);
+        } else {
+            set_cmderr("%s: %s", c.name, err);
+        }
+        n++;
+    }
+    return n;
 }
 
 /* ------------------------------------------------------------------ */
@@ -355,6 +418,8 @@ static void parse_sessions(J *root, Sess *out, int *n)
         J *ps = jget(s, "PlayState");
         Sess *x = &out[(*n)++];
         memset(x, 0, sizeof *x);
+        jcpy(x->id, sizeof x->id, s, "Id");
+        x->remote = jnum(s, "SupportsRemoteControl") != 0;
         jcpy(x->user, sizeof x->user, s, "UserName");
         jcpy(x->device, sizeof x->device, s, "DeviceName");
         jcpy(x->client, sizeof x->client, s, "Client");
@@ -421,17 +486,26 @@ static DWORD WINAPI poll_thread(LPVOID arg)
         if (!server[0] || !apikey[0]) {
             set_err("Set Server and ApiKey in plugins\\jellyfin.ini");
         } else {
-            char *body = fetch_sessions(hs, server, apikey);
+            /* Commands first. Then give the client a moment to act on them, so
+               the poll below sees the new state instead of undoing the
+               optimistic update function5 made. */
+            if (send_cmds(hs, server, apikey) &&
+                WaitForSingleObject(g_stop, 600) == WAIT_OBJECT_0) break;
+            char err[256];
+            char *body = http_req(hs, server, apikey, L"GET",
+                                  L"/Sessions?ActiveWithinSeconds=120", err, sizeof err);
+            if (!body) set_err("%s", err);
             if (body) {
                 const char *p = body;
                 J *root = jparse_val(&p, 0);
                 if (root && root->t == J_ARR) {
                     int n;
                     parse_sessions(root, tmp, &n);
+                    ULONGLONG now = GetTickCount64();
+                    for (int i = 0; i < n; i++) tmp[i].at = now;
                     EnterCriticalSection(&g_cs);
                     memcpy(g_sess, tmp, sizeof(Sess) * n);
                     g_nsess = n;
-                    g_polltime = GetTickCount64();
                     g_havedata = 1;
                     g_err[0] = 0;
                     LeaveCriticalSection(&g_cs);
@@ -442,7 +516,9 @@ static DWORD WINAPI poll_thread(LPVOID arg)
                 free(body);
             }
         }
-        if (WaitForSingleObject(g_stop, interval) == WAIT_OBJECT_0) break;
+        /* Sleep until the next poll, or until function5 queues a command. */
+        HANDLE ev[2] = { g_stop, g_wake };
+        if (WaitForMultipleObjects(2, ev, FALSE, interval) == WAIT_OBJECT_0) break;
     }
     WinHttpCloseHandle(hs);
     return 0;
@@ -455,9 +531,9 @@ static DWORD WINAPI poll_thread(LPVOID arg)
 typedef struct {
     int found;          /* a session matched */
     Sess s;
-    ULONGLONG polltime;
     int count;          /* sessions matching the filter */
     char err[256];
+    char cmderr[256];   /* recent remote-control failure */
     char idle[128];
     char barempty[8];
 } View;
@@ -469,35 +545,46 @@ static int sess_match(const Sess *s, const char *f)
     return !_stricmp(s->user, f) || !_stricmp(s->device, f) || !_stricmp(s->client, f);
 }
 
-/* Snapshot the session to display: matching filter, preferring playing over paused. */
+/* Index of the session to show for filter (matching, playing preferred over
+   paused), or -1. Call with g_cs held. */
+static int pick_locked(const char *filter, int *count)
+{
+    const char *f = is_blank(filter) ? g_deffilter : filter;
+    int best = -1, n = 0;
+    for (int i = 0; i < g_nsess; i++) {
+        if (*f && !sess_match(&g_sess[i], f)) continue;
+        n++;
+        if (best < 0 || (g_sess[best].paused && !g_sess[i].paused)) best = i;
+    }
+    if (count) *count = n;
+    return best;
+}
+
+/* Snapshot the session to display. */
 static void get_view(const char *filter, View *v)
 {
     memset(v, 0, sizeof *v);
     EnterCriticalSection(&g_cs);
-    const char *f = is_blank(filter) ? g_deffilter : filter;
-    int best = -1;
-    for (int i = 0; i < g_nsess; i++) {
-        if (*f && !sess_match(&g_sess[i], f)) continue;
-        v->count++;
-        if (best < 0 || (g_sess[best].paused && !g_sess[i].paused)) best = i;
-    }
+    int best = pick_locked(filter, &v->count);
     if (best >= 0) { v->found = 1; v->s = g_sess[best]; }
-    v->polltime = g_polltime;
     if (!g_havedata || g_err[0]) strcpy(v->err, g_err);
+    if (g_cmderr[0] && GetTickCount64() - g_cmderr_at < CMDERR_SHOW_MS) strcpy(v->cmderr, g_cmderr);
     strcpy(v->idle, g_idle);
     strcpy(v->barempty, g_barempty);
     LeaveCriticalSection(&g_cs);
 }
 
-/* Position, advanced by time since the last poll while playing. */
-static long long cur_pos(const View *v)
+/* Position, advanced by the time since it was last known while playing. */
+static long long sess_pos(const Sess *s)
 {
-    long long p = v->s.pos;
-    if (!v->s.paused)
-        p += (long long)(GetTickCount64() - v->polltime) * 10000LL;
-    if (v->s.dur > 0 && p > v->s.dur) p = v->s.dur;
+    long long p = s->pos;
+    if (!s->paused)
+        p += (long long)(GetTickCount64() - s->at) * 10000LL;
+    if (s->dur > 0 && p > s->dur) p = s->dur;
     return p < 0 ? 0 : p;
 }
+
+static long long cur_pos(const View *v) { return sess_pos(&v->s); }
 
 /* Time styles, picked with a suffix on the field name (pos_mm, time_hms, ...):
  *   TS_AUTO  (none)  M:SS, or H:MM:SS from 1 hour     1:30   1:05:09
@@ -576,7 +663,7 @@ static int field_value(const View *v, const char *name, char *o, size_t sz)
         return 1;
     }
     if (!_stricmp(name, "count")) { snprintf(o, sz, "%d", v->count); return 1; }
-    if (!_stricmp(name, "error")) { snprintf(o, sz, "%s", v->err); return 1; }
+    if (!_stricmp(name, "error")) { snprintf(o, sz, "%s", v->err[0] ? v->err : v->cmderr); return 1; }
 
     /* Everything below is per-session; empty when nothing is playing. */
     int known = 1;
@@ -624,6 +711,7 @@ static void start_thread(void)
     if (!g_thread) {
         ensure_ini();
         g_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
+        g_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
         g_thread = CreateThread(NULL, 0, poll_thread, NULL, 0, NULL);
     }
     LeaveCriticalSection(&g_cs);
@@ -638,14 +726,15 @@ DLLEXPORT void __stdcall SmartieFini(void)
     WaitForSingleObject(g_thread, 5000);
     CloseHandle(g_thread);
     CloseHandle(g_stop);
-    g_thread = g_stop = NULL;
+    CloseHandle(g_wake);
+    g_thread = g_stop = g_wake = NULL;
 }
 
 DLLEXPORT int __stdcall GetMinRefreshInterval(void) { return 250; }
 
 DLLEXPORT char * __stdcall SmartieInfo(void)
 {
-    return "Developer:Spooky098529\r\nVersion:1.0.0\r\n"
+    return "Developer:Spooky098529\r\nVersion:1.1.0\r\n"
            "Shows Jellyfin now-playing info. Configure plugins\\jellyfin.ini\r\n"
            "https://github.com/Spooky098529/lcdsmartie-jellyfin";
 }
@@ -666,6 +755,8 @@ DLLEXPORT char * __stdcall SmartieDemo(void)
            "$dll(jellyfin,3,,)\r\n"
            "Custom format\r\n"
            "$dll(jellyfin,4,{icon} {artist} - {title},)\r\n"
+           "Remote control, for Actions on LCD buttons (PlayPause Stop NextTrack PreviousTrack Seek+10 Seek-10 VolumeUp VolumeDown ToggleMute)\r\n"
+           "$dll(jellyfin,5,PlayPause,)\r\n"
            "Last error\r\n"
            "$dll(jellyfin,20,,)";
 }
@@ -748,6 +839,100 @@ DLLEXPORT char * __stdcall function4(char *param1, char *param2)
     return t_out;
 }
 
+/* 5: remote control. Meant for Actions (e.g. on LCD buttons):
+ *   $MObutton(A) = 1  ->  $dll(jellyfin,5,PlayPause,)
+ * Targets the session the display shows for <filter>. Returns "" because
+ * Smartie runs a $dll action's result as another action. */
+DLLEXPORT char * __stdcall function5(char *param1, char *param2)
+{
+    static const struct { const char *name; const char *path; int effect; } cmds[] = {
+        /* effect: 1 toggle pause, 2 pause, 3 unpause (applied to the cache at once) */
+        { "PlayPause",     "Playing/PlayPause",     1 },
+        { "Pause",         "Playing/Pause",         2 },
+        { "Unpause",       "Playing/Unpause",       3 },
+        { "Play",          "Playing/Unpause",       3 },
+        { "Stop",          "Playing/Stop",          0 },
+        { "NextTrack",     "Playing/NextTrack",     0 },
+        { "Next",          "Playing/NextTrack",     0 },
+        { "PreviousTrack", "Playing/PreviousTrack", 0 },
+        { "Previous",      "Playing/PreviousTrack", 0 },
+        { "Prev",          "Playing/PreviousTrack", 0 },
+        { "VolumeUp",      "Command/VolumeUp",      0 },
+        { "VolumeDown",    "Command/VolumeDown",    0 },
+        { "ToggleMute",    "Command/ToggleMute",    0 },
+        { "Mute",          "Command/Mute",          0 },
+        { "Unmute",        "Command/Unmute",        0 },
+    };
+    const char *name = param1 ? param1 : "";
+    int ci = -1;
+    long seek = 0;
+    t_out[0] = 0;
+    start_thread();
+
+    for (int i = 0; i < (int)(sizeof cmds / sizeof *cmds); i++)
+        if (!_stricmp(name, cmds[i].name)) { ci = i; break; }
+    if (ci < 0) {
+        /* Seek+N / Seek-N: relative seek by N seconds */
+        char *end;
+        if (_strnicmp(name, "Seek", 4) || !name[4] ||
+            (seek = strtol(name + 4, &end, 10), *end) || !seek) {
+            set_cmderr("Unknown command '%s'", name);
+            return t_out;
+        }
+    }
+
+    EnterCriticalSection(&g_cs);
+    int i = pick_locked(param2, NULL);
+    if (i < 0) {
+        LeaveCriticalSection(&g_cs);
+        set_cmderr("%s: nothing playing", name);
+        return t_out;
+    }
+    Sess *s = &g_sess[i];
+    if (!s->remote) {
+        char client[64];
+        strcpy(client, s->client);
+        LeaveCriticalSection(&g_cs);
+        set_cmderr("%s: %s has no remote control", name, client);
+        return t_out;
+    }
+    if (g_qlen == MAX_CMDS) {
+        LeaveCriticalSection(&g_cs);
+        set_cmderr("%s: too many queued commands", name);
+        return t_out;
+    }
+
+    Cmd *c = &g_q[(g_qhead + g_qlen) % MAX_CMDS];
+    WCHAR wid[64];
+    MultiByteToWideChar(CP_UTF8, 0, s->id, -1, wid, 64);
+    snprintf(c->name, sizeof c->name, "%s", name);
+
+    /* Update the cache now so the display reacts before the next poll. */
+    ULONGLONG now = GetTickCount64();
+    if (ci < 0) {
+        long long target = sess_pos(s) + (long long)seek * TICKS_PER_SEC;
+        if (target < 0) target = 0;
+        if (s->dur > 0 && target > s->dur) target = s->dur;
+        _snwprintf(c->path, 256, L"/Sessions/%ls/Playing/Seek?SeekPositionTicks=%lld", wid, target);
+        s->pos = target;
+        s->at = now;
+    } else {
+        WCHAR wpath[32];
+        MultiByteToWideChar(CP_UTF8, 0, cmds[ci].path, -1, wpath, 32);
+        _snwprintf(c->path, 256, L"/Sessions/%ls/%ls", wid, wpath);
+        if (cmds[ci].effect) {
+            s->pos = sess_pos(s);
+            s->at = now;
+            s->paused = cmds[ci].effect == 1 ? !s->paused : cmds[ci].effect == 2;
+        }
+    }
+    c->path[255] = 0;
+    g_qlen++;
+    LeaveCriticalSection(&g_cs);
+    SetEvent(g_wake);
+    return t_out;
+}
+
 /* 20: status / last error */
 DLLEXPORT char * __stdcall function20(char *param1, char *param2)
 {
@@ -755,7 +940,7 @@ DLLEXPORT char * __stdcall function20(char *param1, char *param2)
     (void)param1; (void)param2;
     start_thread();
     get_view(NULL, &v);
-    snprintf(t_out, OUTSZ, "%s", v.err[0] ? v.err : "OK");
+    snprintf(t_out, OUTSZ, "%s", v.err[0] ? v.err : v.cmderr[0] ? v.cmderr : "OK");
     return t_out;
 }
 
